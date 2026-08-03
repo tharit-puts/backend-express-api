@@ -1,19 +1,26 @@
 {
   "name": "backend-personal-blog",
   "version": "1.0.0",
-  "description": "",
+  "description": "Personal blog REST API (Express 5 + PostgreSQL)",
   "main": "app.mjs",
+  "type": "module",
   "scripts": {
-    "start": "nodemon app.mjs"
+    "start": "node app.mjs",
+    "dev": "nodemon app.mjs",
+    "seed": "node seed.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
+    "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "nodemon": "^3.1.14",
+    "jsonwebtoken": "^9.0.3",
     "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
   }
 }
