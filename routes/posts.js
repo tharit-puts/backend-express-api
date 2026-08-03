@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { connectionPool } from "../utils/db.js";
-import { attachUserIfPresent, protectAdmin } from "../middlewares/protect.js";
+import { attachUserIfPresent, protect } from "../middlewares/protect.js";
 
 const postRouter = Router();
 
@@ -17,6 +17,9 @@ const POST_COLUMNS = `
   p.content,
   c.name AS category,
   p.author,
+  p.author_id,
+  u.avatar AS author_avatar,
+  u.bio AS author_bio,
   p.image,
   p.likes,
   p.status,
@@ -26,6 +29,7 @@ const POST_COLUMNS = `
 const POST_FROM = `
   FROM posts p
   INNER JOIN categories c ON c.id = p.category_id
+  LEFT JOIN users u ON u.id = p.author_id
 `;
 
 // แปลงแถวจาก database ให้เป็นรูปแบบที่ frontend ต้องการ
@@ -37,6 +41,9 @@ function toPost(row) {
     content: row.content,
     category: row.category,
     author: row.author,
+    authorId: row.author_id ?? null,
+    authorAvatar: row.author_avatar ?? null,
+    authorBio: row.author_bio ?? null,
     image: row.image,
     date: row.created_at.toISOString(),
     likes: row.likes,
@@ -52,11 +59,11 @@ function escapeLikePattern(text) {
 
 // สร้าง WHERE + ค่าพารามิเตอร์ ใช้ร่วมกันทั้ง query นับจำนวนและ query ดึงข้อมูล
 // ใช้ $1, $2 (parameterized query) เสมอ ไม่ต่อ string เข้า SQL ตรง ๆ เพื่อกัน SQL injection
-function buildPostFilters({ category, keyword, status }) {
+function buildPostFilters({ category, keyword, status, authorId }) {
   const conditions = [];
   const values = [];
 
-  // status = "all" คือไม่กรองสถานะเลย (เฉพาะ admin ที่ขอมาแบบนั้นได้)
+  // status = "all" คือไม่กรองสถานะเลย (admin ทั้งระบบ หรือเจ้าของดูของตัวเองด้วย mine=true)
   if (status !== "all") {
     values.push(status);
     conditions.push(`p.status = $${values.length}`);
@@ -77,8 +84,28 @@ function buildPostFilters({ category, keyword, status }) {
     );
   }
 
+  // mine=true — ดูเฉพาะบทความที่ตัวเองเป็นเจ้าของ
+  if (authorId) {
+    values.push(authorId);
+    conditions.push(`p.author_id = $${values.length}`);
+  }
+
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   return { where, values };
+}
+
+async function getPostOwnership(id) {
+  const result = await connectionPool.query(
+    `SELECT id, author_id, status FROM posts WHERE id = $1`,
+    [id]
+  );
+  return result.rows[0] ?? null;
+}
+
+function canManagePost(user, authorId) {
+  if (!user) return false;
+  if (user.role === "admin") return true;
+  return authorId != null && Number(authorId) === Number(user.id);
 }
 
 function parsePostId(value) {
@@ -154,7 +181,7 @@ function validatePost({ title, description, content, author, status }) {
   return null;
 }
 
-// GET /posts?page=1&limit=6&category=Cat&keyword=xxx&status=all
+// GET /posts?page=1&limit=6&category=Cat&keyword=xxx&status=all&mine=true
 postRouter.get("/", attachUserIfPresent, async (req, res) => {
   // ถ้าไม่ส่งมาหรือส่งค่าเพี้ยน ให้ตกไปใช้ค่า default
   const page = Math.max(1, Number(req.query.page) || 1);
@@ -166,17 +193,29 @@ postRouter.get("/", attachUserIfPresent, async (req, res) => {
   const keyword =
     typeof req.query.keyword === "string" ? req.query.keyword.trim() : "";
 
-  // ผู้เยี่ยมชมทั่วไปเห็นเฉพาะ published เท่านั้น
-  // เฉพาะ admin ที่ระบุ status มาเองจึงจะดู draft หรือดูทั้งหมดได้ (หน้า Article management ต้องใช้)
+  // mine=true = ขอเฉพาะบทความของตัวเอง (ต้อง login) ใช้ในหน้า My articles
+  const mine = req.query.mine === "true";
+  if (mine && !req.user) {
+    return res.status(401).json({ message: "Authorization token is required" });
+  }
+
+  // ผู้เยี่ยมชมทั่วไปเห็นเฉพาะ published
+  // admin ทั้งระบบ หรือเจ้าของที่ขอ mine=true ดู draft / all ได้
   const requestedStatus = req.query.status;
   const isAdmin = req.user?.role === "admin";
   const allowedStatuses = ["all", "draft", "published"];
+  const canViewPrivateStatus = isAdmin || mine;
   const status =
-    isAdmin && allowedStatuses.includes(requestedStatus)
+    canViewPrivateStatus && allowedStatuses.includes(requestedStatus)
       ? requestedStatus
       : "published";
 
-  const { where, values } = buildPostFilters({ category, keyword, status });
+  const { where, values } = buildPostFilters({
+    category,
+    keyword,
+    status,
+    authorId: mine ? req.user.id : null,
+  });
 
   try {
     // นับจำนวนทั้งหมดที่ตรงเงื่อนไข เพื่อคำนวณ totalPages
@@ -208,18 +247,28 @@ postRouter.get("/", attachUserIfPresent, async (req, res) => {
   }
 });
 
-// GET /posts/:id — บทความเดียว (คืนทั้ง published และ draft เพื่อให้หน้าแก้ไขของ admin ใช้ได้)
-postRouter.get("/:id", async (req, res) => {
+// GET /posts/:id — บทความเดียว
+// published เปิดสาธารณะ / draft เห็นได้เฉพาะเจ้าของหรือ admin
+postRouter.get("/:id", attachUserIfPresent, async (req, res) => {
   const id = parsePostId(req.params.id);
   if (!id) {
     return res.status(400).json({ message: "Invalid post id" });
   }
 
   try {
-    const post = await fetchPostById(id);
-    if (!post) {
+    const ownership = await getPostOwnership(id);
+    if (!ownership) {
       return res.status(404).json({ message: "Post not found" });
     }
+
+    if (
+      ownership.status === "draft" &&
+      !canManagePost(req.user, ownership.author_id)
+    ) {
+      return res.status(404).json({ message: "Post not found" });
+    }
+
+    const post = await fetchPostById(id);
     return res.status(200).json(post);
   } catch (error) {
     console.error(error);
@@ -228,13 +277,18 @@ postRouter.get("/:id", async (req, res) => {
 });
 
 // ---------------------------------------------------------------
-// ตั้งแต่นี้ลงไปต้อง login เป็น admin (ใส่ protectAdmin เป็นตัวที่ 2)
+// เขียนบทความ — login แล้วสร้างได้ / แก้-ลบได้เฉพาะของตัวเอง (หรือ admin)
 // ---------------------------------------------------------------
 
-// POST /posts — สร้างบทความใหม่
-postRouter.post("/", protectAdmin, async (req, res) => {
-  const { title, description, content, author, image } = req.body ?? {};
+// POST /posts — สร้างบทความใหม่ (user และ admin)
+postRouter.post("/", protect, async (req, res) => {
+  const { title, description, content, image } = req.body ?? {};
   const status = req.body?.status ?? "draft";
+  // ชื่อผู้เขียนบังคับจากบัญชีที่ login อยู่ เพื่อไม่ให้แอบอ้างชื่อคนอื่น
+  const author =
+    typeof req.body?.author === "string" && req.body.author.trim() !== ""
+      ? req.body.author.trim()
+      : req.user.name;
 
   const invalid = validatePost({ title, description, content, author, status });
   if (invalid) {
@@ -248,15 +302,16 @@ postRouter.post("/", protectAdmin, async (req, res) => {
     }
 
     const inserted = await connectionPool.query(
-      `INSERT INTO posts (title, description, content, category_id, author, image, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO posts (title, description, content, category_id, author, author_id, image, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id`,
       [
         title.trim(),
         description.trim(),
         content,
         category.id,
-        author.trim(),
+        author,
+        req.user.id,
         typeof image === "string" && image.trim() !== "" ? image.trim() : null,
         status,
       ]
@@ -270,8 +325,8 @@ postRouter.post("/", protectAdmin, async (req, res) => {
   }
 });
 
-// PUT /posts/:id — แก้ไขบทความ (ส่งมาแค่ช่องที่อยากแก้ก็ได้)
-postRouter.put("/:id", protectAdmin, async (req, res) => {
+// PUT /posts/:id — แก้ไขบทความของตัวเอง (admin แก้ได้ทุกบทความ)
+postRouter.put("/:id", protect, async (req, res) => {
   const id = parsePostId(req.params.id);
   if (!id) {
     return res.status(400).json({ message: "Invalid post id" });
@@ -280,19 +335,24 @@ postRouter.put("/:id", protectAdmin, async (req, res) => {
   const body = req.body ?? {};
 
   try {
-    // อ่านของเดิมมาก่อน แล้วเอาค่าใหม่ทับเฉพาะช่องที่ส่งมา
-    // ทำแบบนี้เพื่อให้ตรวจความถูกต้องของ "ผลลัพธ์สุดท้าย" ได้
-    // เช่น ถ้าเปลี่ยนสถานะเป็น published ต้องเช็ค content เดิมว่ามีหัวข้อครบไหม
-    const existing = await fetchPostById(id);
-    if (!existing) {
+    const ownership = await getPostOwnership(id);
+    if (!ownership) {
       return res.status(404).json({ message: "Post not found" });
     }
+    if (!canManagePost(req.user, ownership.author_id)) {
+      return res.status(403).json({ message: "You can only edit your own articles" });
+    }
 
+    const existing = await fetchPostById(id);
     const merged = {
       title: body.title ?? existing.title,
       description: body.description ?? existing.description,
       content: body.content ?? existing.content,
-      author: body.author ?? existing.author,
+      // user ทั่วไปห้ามเปลี่ยนชื่อผู้เขียน — admin เปลี่ยนได้ถ้าส่งมา
+      author:
+        req.user.role === "admin" && typeof body.author === "string"
+          ? body.author
+          : existing.author,
       status: body.status ?? existing.status,
       image: body.image !== undefined ? body.image : existing.image,
     };
@@ -302,7 +362,6 @@ postRouter.put("/:id", protectAdmin, async (req, res) => {
       return res.status(400).json({ message: invalid });
     }
 
-    // ถ้าไม่ได้ส่งหมวดหมู่มา ให้ใช้ของเดิม (existing.category เป็นชื่อหมวดหมู่)
     const category = await resolveCategoryId(
       body.category !== undefined || body.category_id !== undefined
         ? body
@@ -339,22 +398,23 @@ postRouter.put("/:id", protectAdmin, async (req, res) => {
   }
 });
 
-// DELETE /posts/:id — ลบบทความ
-postRouter.delete("/:id", protectAdmin, async (req, res) => {
+// DELETE /posts/:id — ลบบทความของตัวเอง (admin ลบได้ทุกบทความ)
+postRouter.delete("/:id", protect, async (req, res) => {
   const id = parsePostId(req.params.id);
   if (!id) {
     return res.status(400).json({ message: "Invalid post id" });
   }
 
   try {
-    const result = await connectionPool.query(
-      `DELETE FROM posts WHERE id = $1 RETURNING id`,
-      [id]
-    );
-
-    if (result.rows.length === 0) {
+    const ownership = await getPostOwnership(id);
+    if (!ownership) {
       return res.status(404).json({ message: "Post not found" });
     }
+    if (!canManagePost(req.user, ownership.author_id)) {
+      return res.status(403).json({ message: "You can only delete your own articles" });
+    }
+
+    await connectionPool.query(`DELETE FROM posts WHERE id = $1`, [id]);
 
     return res.status(200).json({ message: "Post deleted successfully" });
   } catch (error) {

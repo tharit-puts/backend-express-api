@@ -4,6 +4,8 @@ import cors from "cors";
 
 import authRouter from "./routes/auth.js";
 import categoryRouter from "./routes/categories.js";
+import commentRouter from "./routes/comments.js";
+import notificationRouter from "./routes/notifications.js";
 import postRouter from "./routes/posts.js";
 
 const app = express();
@@ -29,6 +31,9 @@ app.get("/health", (req, res) => {
 // ทุก path ที่ขึ้นต้นด้วย /auth ส่งต่อให้ authRouter จัดการ (ที่อื่นก็หลักการเดียวกัน)
 app.use("/auth", authRouter);
 app.use("/categories", categoryRouter);
+app.use("/notifications", notificationRouter);
+// ต้อง mount ก่อน /posts เพราะ Express จับ path แบบเฉพาะเจาะจงก่อน
+app.use("/posts/:postId/comments", commentRouter);
 app.use("/posts", postRouter);
 
 // ถ้าไม่ตรง route ไหนเลย ตอบ 404 ในรูปแบบเดียวกับ error อื่น ๆ
