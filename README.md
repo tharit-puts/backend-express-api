@@ -81,11 +81,13 @@ UPDATE users SET role = 'admin' WHERE email = 'you@example.com';
 
 | Method | Path | สิทธิ์ |
 |---|---|---|
-| GET | `/posts` | ทุกคน |
-| GET | `/posts/:id` | ทุกคน |
-| POST | `/posts` | admin |
-| PUT | `/posts/:id` | admin |
-| DELETE | `/posts/:id` | admin |
+| GET | `/posts` | ทุกคน (หรือ login แล้วใช้ `mine=true`) |
+| GET | `/posts/:id` | published = ทุกคน / draft = เจ้าของหรือ admin |
+| POST | `/posts` | ต้อง login (user หรือ admin) |
+| PUT | `/posts/:id` | เจ้าของบทความ หรือ admin |
+| DELETE | `/posts/:id` | เจ้าของบทความ หรือ admin |
+
+`GET /posts?mine=true&status=all` — ดึงเฉพาะบทความของตัวเอง รวม draft (ใช้หน้า My articles)
 
 **`GET /posts`** — query parameter ทุกตัวใส่หรือไม่ใส่ก็ได้
 
@@ -141,6 +143,49 @@ UPDATE users SET role = 'admin' WHERE email = 'you@example.com';
   (หรือส่ง `category_id` เป็นตัวเลขมาตรง ๆ ก็ได้)
 - `status` ถ้าไม่ส่งจะเป็น `draft`
 - `PUT` ส่งมาแค่ช่องที่อยากแก้ก็ได้ ช่องที่ไม่ส่งจะคงค่าเดิม
+
+### Notifications
+
+| Method | Path | สิทธิ์ |
+|---|---|---|
+| GET | `/notifications` | ต้อง login |
+| GET | `/notifications/unread-count` | ต้อง login |
+| PATCH | `/notifications/read` | ต้อง login |
+
+เมื่อมีคน comment บทความ ระบบจะสร้างแจ้งเตือนให้:
+- เจ้าของบทความ (`posts.author_id`) ถ้ามี
+- หรือ admin ทุกคน ถ้าเป็นบทความ seed ที่ยังไม่มีเจ้าของ
+- ไม่แจ้งตัวเอง
+
+ถ้ายังไม่มีตาราง ให้รัน `node migrate-notifications.js`
+
+### Comments
+
+| Method | Path | สิทธิ์ |
+|---|---|---|
+| GET | `/posts/:postId/comments` | ทุกคน |
+| POST | `/posts/:postId/comments` | ต้อง login |
+
+```json
+// GET คืน array, POST คืน object เดียว
+{
+  "id": 1,
+  "postId": 25,
+  "userId": 3,
+  "name": "Emma R.",
+  "text": "Love this post!",
+  "date": "2024-09-15T19:12:00.000Z",
+  "avatar": null
+}
+```
+
+**body ของ POST**
+
+```json
+{ "content": "What are your thoughts?" }
+```
+
+ถ้ายังไม่มีตาราง `comments` ใน database ให้รัน `node migrate-comments.js` ครั้งเดียว
 
 ### Categories
 
